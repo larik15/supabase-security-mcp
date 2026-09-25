@@ -20,6 +20,7 @@ const SQL_FUNCTIONS = `
 select p.proname as name,
        pg_get_function_identity_arguments(p.oid) as args,
        p.prosecdef as security_definer,
+       p.proconfig as proconfig,
        has_function_privilege('anon', p.oid, 'EXECUTE') as anon_can_execute,
        has_function_privilege('authenticated', p.oid, 'EXECUTE') as authenticated_can_execute
 from pg_proc p
@@ -44,6 +45,20 @@ function isTrueExpr(expr) {
   if (expr == null) return false;
   const s = String(expr).trim().toLowerCase().replace(/^\(+|\)+$/g, "");
   return s === "true";
+}
+
+function hasAuthRef(expr) {
+  if (expr == null) return false;
+  const s = String(expr).toLowerCase();
+  return s.includes("auth.uid()") || s.includes("current_setting(");
+}
+
+function normExpr(expr) {
+  return expr == null ? null : String(expr).trim().toLowerCase().replace(/^\(+|\)+$/g, "");
+}
+
+function hasSearchPath(proconfig) {
+  return Array.isArray(proconfig) && proconfig.some(c => String(c).toLowerCase().startsWith("search_path"));
 }
 
 /**
@@ -125,6 +140,15 @@ export function analyzePolicies(policies, tables = []) {
         fix: `Add using (auth.uid() = user_id) (and with check for UPDATE).`,
       });
     }
+
+    if ((cmd === "UPDATE" || cmd === "ALL") && p.with_check != null && normExpr(p.with_check) !== normExpr(p.qual)
+        && (checkTrue || !hasAuthRef(p.with_check)) && hasAuthRef(p.qual)) {
+      findings.push({
+        severity: "high", kind: "policy_check_broader_than_using", table: p.table, policy: p.policy,
+        message: `Policy "${p.policy}" on public.${p.table} (${cmd}) has a with check that is broader than its using clause — new/updated rows aren't checked with the same ownership condition as visible rows.`,
+        fix: `Make with check match using, e.g. with check (auth.uid() = user_id).`,
+      });
+    }
   }
 
   for (const t of tables) {
@@ -140,7 +164,7 @@ export function analyzePolicies(policies, tables = []) {
 }
 
 /**
- * @param {Array<{name:string,args:string,security_definer:boolean,anon_can_execute:boolean,authenticated_can_execute:boolean}>} fns
+ * @param {Array<{name:string,args:string,security_definer:boolean,proconfig:string[]|null,anon_can_execute:boolean,authenticated_can_execute:boolean}>} fns
  */
 export function analyzeFunctions(fns) {
   const findings = [];
@@ -152,6 +176,13 @@ export function analyzeFunctions(fns) {
         severity: f.anon_can_execute ? "high" : "medium", kind: "definer_function_exposed", table: null, function: `${f.name}(${f.args})`,
         message: `Function public.${f.name}(${f.args}) runs as SECURITY DEFINER (bypasses RLS) and is executable by [${who.join(", ")}].`,
         fix: `Add an explicit auth check inside the function (e.g. auth.uid() is not null and ownership), or revoke execute from ${who.join("/")}.`,
+      });
+    }
+    if (!hasSearchPath(f.proconfig)) {
+      findings.push({
+        severity: "medium", kind: "definer_function_no_search_path", table: null, function: `${f.name}(${f.args})`,
+        message: `Function public.${f.name}(${f.args}) runs as SECURITY DEFINER without a pinned search_path — vulnerable to search_path hijacking via a malicious schema earlier in the resolution order.`,
+        fix: `alter function public.${f.name}(${f.args}) set search_path = public, pg_catalog;`,
       });
     }
   }

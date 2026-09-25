@@ -1,0 +1,25 @@
+{
+  "name": "supabase-security-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that audits a Supabase project's security from Claude, Cursor or any MCP client: anon-key probe, RLS policy audit, and a two-account cross-tenant test.",
+  "type": "module",
+  "bin": { "supabase-security-mcp": "bin/cli.mjs" },
+  "main": "src/server.mjs",
+  "files": ["bin/", "src/", "scripts/", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "start": "node bin/cli.mjs",
+    "demo": "node scripts/demo.mjs"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "pg": "^8.23.0",
+    "zod": "^4.6.5"
+  },
+  "keywords": ["mcp", "model-context-protocol", "supabase", "rls", "row-level-security", "security", "audit", "postgres", "claude", "cursor"],
+  "author": "larik15",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/larik15/supabase-security-mcp.git" },
+  "homepage": "https://github.com/larik15/supabase-security-mcp#readme"
+}

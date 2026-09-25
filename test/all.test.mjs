@@ -37,6 +37,25 @@ test("using(true) select for anon is high; missing TO clause flagged; open updat
   assert.ok(!kinds.some(k => k.startsWith("profiles:")), "ownership policy must not be flagged");
 });
 
+test("with check broader than using is flagged on UPDATE/ALL; matching or narrower checks are not", () => {
+  const policies = [
+    // with_check bare true while using has an ownership check
+    { table: "posts", policy: "own update, open check", roles: "{authenticated}", cmd: "UPDATE", qual: "(auth.uid() = user_id)", with_check: "true" },
+    // with_check has no auth.uid()/current_setting reference at all, while using does
+    { table: "posts", policy: "own update, check status only", roles: "{authenticated}", cmd: "UPDATE", qual: "(auth.uid() = user_id)", with_check: "(status = 'draft')" },
+    // matching check: not flagged
+    { table: "posts", policy: "own update, matching check", roles: "{authenticated}", cmd: "ALL", qual: "(auth.uid() = user_id)", with_check: "(auth.uid() = user_id)" },
+    // no with_check at all: not flagged (nothing to compare)
+    { table: "posts", policy: "own update, no check", roles: "{authenticated}", cmd: "UPDATE", qual: "(auth.uid() = user_id)", with_check: null },
+    // qual itself has no auth ref: not flagged (nothing narrower being widened)
+    { table: "posts", policy: "always visible, checked insert", roles: "{authenticated}", cmd: "UPDATE", qual: "(status = 'draft')", with_check: "true" },
+  ];
+  const f = analyzePolicies(policies);
+  const flagged = f.filter(x => x.kind === "policy_check_broader_than_using").map(x => x.policy);
+  assert.deepEqual(flagged.sort(), ["own update, check status only", "own update, open check"].sort());
+  assert.ok(f.filter(x => x.kind === "policy_check_broader_than_using").every(x => x.severity === "high"));
+});
+
 test("roles given as array are handled; parenthesised '(true)' counts as true", () => {
   const f = analyzePolicies([{ table: "t", policy: "p", roles: ["anon"], cmd: "SELECT", qual: "(true)", with_check: null }]);
   assert.equal(f[0].kind, "policy_open_read");
@@ -44,13 +63,26 @@ test("roles given as array are handled; parenthesised '(true)' counts as true", 
 
 test("security definer functions exposed to anon/authenticated are flagged, invoker functions are not", () => {
   const f = analyzeFunctions([
-    { name: "get_stats", args: "", security_definer: true, anon_can_execute: true, authenticated_can_execute: true },
-    { name: "safe_fn", args: "", security_definer: false, anon_can_execute: true, authenticated_can_execute: true },
-    { name: "internal", args: "p int", security_definer: true, anon_can_execute: false, authenticated_can_execute: false },
+    { name: "get_stats", args: "", security_definer: true, proconfig: ["search_path=public"], anon_can_execute: true, authenticated_can_execute: true },
+    { name: "safe_fn", args: "", security_definer: false, proconfig: null, anon_can_execute: true, authenticated_can_execute: true },
+    { name: "internal", args: "p int", security_definer: true, proconfig: ["search_path=public"], anon_can_execute: false, authenticated_can_execute: false },
   ]);
   assert.equal(f.length, 1);
   assert.equal(f[0].severity, "high");
+  assert.equal(f[0].kind, "definer_function_exposed");
   assert.match(f[0].function, /get_stats/);
+});
+
+test("security definer functions without a pinned search_path are flagged medium; a set search_path clears it", () => {
+  const f = analyzeFunctions([
+    { name: "no_path", args: "", security_definer: true, proconfig: null, anon_can_execute: false, authenticated_can_execute: false },
+    { name: "with_path", args: "", security_definer: true, proconfig: ["search_path=public, pg_catalog"], anon_can_execute: false, authenticated_can_execute: false },
+    { name: "invoker_no_path", args: "", security_definer: false, proconfig: null, anon_can_execute: false, authenticated_can_execute: false },
+  ]);
+  assert.equal(f.length, 1);
+  assert.equal(f[0].kind, "definer_function_no_search_path");
+  assert.equal(f[0].severity, "medium");
+  assert.match(f[0].function, /no_path/);
 });
 
 // ---------- two-account test with a fake Supabase ----------

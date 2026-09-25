@@ -12,7 +12,7 @@ Ask your assistant *"is my Supabase project safe to ship?"* and it can actually 
 |---|---|---|
 | `probe_anon` | What a stranger can read with only the public anon key: tables, storage buckets, RPCs | anon key |
 | `audit_policies` | Reads `pg_policies` / `pg_class` / `pg_proc`: RLS off on exposed tables, `using (true)` / `with check (true)`, policies with **no `TO` clause** (they apply to PUBLIC), `SECURITY DEFINER` functions callable by anon/authenticated | database URL |
-| `two_account_test` | Creates two throwaway users, inserts a row as A, tries to read / update / delete it as B and as anon through the real REST API, then cleans up. The cross-tenant check no scanner does | service role key (setup/cleanup only) |
+| `two_account_test` | Creates two throwaway users, inserts a row as A, tries to read / update / delete it as B and as anon through the real REST API, then cleans up. The cross-tenant check most people never run | service role key (setup/cleanup only) |
 | `security_report` | All of the above as one Markdown report sorted by severity | any of the above |
 
 Everything is read-only except `two_account_test`, which inserts and deletes its own

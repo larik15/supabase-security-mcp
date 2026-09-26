@@ -115,6 +115,19 @@ node scripts/demo.mjs --tables leads_open,leads_fixed \
   table — that can be intended (server-only writes) or a policy bug; you decide.
 - Test users are `rlscheck-a-*@example.com` / `rlscheck-b-*@example.com` and are deleted at the end.
 
+## Keys and safety
+
+- Prefer passing `SUPABASE_SERVICE_ROLE_KEY` / `DATABASE_URL` as arguments on the tool
+  call rather than in the MCP server's env. Env values in `claude_desktop_config.json`
+  sit there in plain text; a value passed per call only exists for that call.
+- Run `audit_policies` against a staging project, or with a read-only database user,
+  when you can — it only runs `select` queries against `pg_catalog`, but a read-only
+  role means a typo or a future change to this tool can't do more than that by accident.
+- `two_account_test` creates two real auth users, inserts a row as one of them, and
+  tries to read/update/delete it as the other — then deletes the row and both users.
+  Don't run it against production without a backup: a policy bug can leave a row
+  modified or deleted by the "wrong" user before the test notices and cleans up.
+
 ## Development
 
 ```bash

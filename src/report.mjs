@@ -26,7 +26,7 @@ export function buildReport(parts) {
   if (parts.probe) {
     lines.push(`## Anonymous access (anon key only)`);
     for (const r of parts.probe) {
-      lines.push(`- ${r.open ? "**OPEN**" : "closed"} \`${r.kind}\` **${r.target}** — ${r.detail}`);
+      lines.push(`- ${r.open ? "**OPEN**" : r.skipped ? "not called" : "closed"} \`${r.kind}\` **${r.target}** — ${r.detail}`);
       if (r.open) all.push({ severity: r.kind === "rpc" ? "medium" : "high", kind: `anon_open_${r.kind}`, table: r.target,
         message: `${r.kind} ${r.target} returns data to an anonymous request.`, fix: r.kind === "bucket" ? "Make the bucket private or scope it with a storage policy." : r.kind === "rpc" ? "Add an auth check inside the function or revoke execute from anon." : "Fix the select policy to check ownership." });
     }
@@ -38,7 +38,8 @@ export function buildReport(parts) {
     const t = parts.policies.tables || [];
     const tables = t.filter(x => !x.relkind || x.relkind === "r" || x.relkind === "p");
     const restrictive = parts.policies.restrictivePolicies || [];
-    lines.push(`Tables in public: ${tables.length}; with RLS: ${tables.filter(x => x.rls_enabled).length}; views/other relations: ${t.length - tables.length}; policies: ${(parts.policies.policies || []).length}${restrictive.length ? ` (${restrictive.length} restrictive, not checked for open expressions)` : ""}; SECURITY DEFINER functions: ${(parts.policies.functions || []).length}`);
+    const schema = parts.policies.summary?.schema || "public";
+    lines.push(`Tables in ${schema}: ${tables.length}; with RLS: ${tables.filter(x => x.rls_enabled).length}; views/other relations: ${t.length - tables.length}; policies: ${(parts.policies.policies || []).length}${restrictive.length ? ` (${restrictive.length} restrictive, not checked for open expressions)` : ""}; SECURITY DEFINER functions: ${(parts.policies.functions || []).length}`);
     if (parts.policies.tls === "UNVERIFIED") lines.push(`**Warning:** TLS certificate verification was disabled for this connection.`);
     all.push(...(parts.policies.findings || []));
     lines.push("");
@@ -48,7 +49,7 @@ export function buildReport(parts) {
     lines.push(`## Two-account test (user B vs user A's rows)`);
     for (const r of parts.twoAccount.results || []) {
       const s = r.steps;
-      lines.push(`- **${r.table}** — owner insert: ${s.owner_insert ?? "-"} · other-user select: ${s.other_user_select ?? "-"} · anon select: ${s.anon_select ?? "-"} · other-user update: ${s.other_user_update ?? "-"} · other-user delete: ${s.other_user_delete ?? "-"} · insert as owner: ${s.other_user_insert_as_owner ?? "-"} · reassign owner: ${s.other_user_reassign_owner ?? "-"}${r.leaks.length ? ` → **LEAK: ${r.leaks.join(", ")}**` : " → ok"}`);
+      lines.push(`- **${r.table}** — owner insert: ${s.owner_insert ?? "-"} · other-user select: ${s.other_user_select ?? "-"} · anon select: ${s.anon_select ?? "-"} · other-user update: ${s.other_user_update ?? "-"} · anon update: ${s.anon_update ?? "-"} · anon delete: ${s.anon_delete ?? "-"} · other-user delete: ${s.other_user_delete ?? "-"} · insert as owner: ${s.other_user_insert_as_owner ?? "-"} · reassign owner: ${s.other_user_reassign_owner ?? "-"}${r.leaks.length ? ` → **LEAK: ${r.leaks.join(", ")}**` : " → ok"}`);
       for (const n of r.notes) lines.push(`  - note: ${n}`);
     }
     // The anon-key probe already reports a table that's readable anonymously; don't

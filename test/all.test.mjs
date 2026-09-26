@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { analyzeTables, analyzePolicies, analyzeFunctions, analyzeBuckets, classifyExpr } from "../src/policies.mjs";
+import { analyzeTables, analyzePolicies, analyzeFunctions, analyzeBuckets, classifyExpr, hasAuthRef, referencesUserMetadata, makeIgnore } from "../src/policies.mjs";
 import { twoAccountTest } from "../src/twoAccount.mjs";
 import { buildReport } from "../src/report.mjs";
 import { createServer } from "../src/server.mjs";
@@ -93,12 +93,62 @@ test("missing TO clause: info over an ownership expression, high over an open on
   assert.ok(open.issues.includes("policy_no_to_clause"));
 });
 
-test("ownership policies with an explicit TO clause and TO service_role policies are not flagged", () => {
+test("ownership policies with an explicit TO clause are not flagged; TO service_role is dead code (info), never open_*", () => {
   const { findings } = analyzePolicies([
     P({ table: "profiles", policy: "own rows", roles: "{authenticated}", cmd: "ALL", qual: "(auth.uid() = user_id)", with_check: "(auth.uid() = user_id)" }),
     P({ table: "profiles", policy: "service", roles: "{service_role}", cmd: "ALL", qual: "true", with_check: "true" }),
   ], [{ schema: "public", table: "profiles", relkind: "r", rls_enabled: true }]);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "policy_for_service_role");
+  assert.equal(findings[0].severity, "info");
+  assert.deepEqual(findings[0].issues, ["policy_for_service_role"]);
+  assert.match(findings[0].message, /does nothing, drop it/);
+  assert.match(findings[0].fix, /drop policy "service" on public\.profiles;/);
+});
+
+test("policies on tables with RLS off are skipped (rls_disabled covers the table)", () => {
+  const { findings } = analyzePolicies(
+    [P({ table: "leads", policy: "anyone", roles: "{anon}", cmd: "SELECT", qual: "true" })],
+    [{ schema: "public", table: "leads", relkind: "r", rls_enabled: false }]
+  );
   assert.deepEqual(findings, []);
+});
+
+test("user_metadata is not an auth check and gets its own high finding", () => {
+  const meta = "(((auth.jwt() -> 'user_metadata'::text) ->> 'role'::text) = 'admin'::text)";
+  const metaSetting = "((((current_setting('request.jwt.claims'::text, true))::json -> 'user_metadata'::text) ->> 'org'::text) = (org_id)::text)";
+  assert.equal(hasAuthRef(meta), false);
+  assert.equal(referencesUserMetadata(meta), true);
+  assert.equal(referencesUserMetadata(metaSetting), true);
+  assert.equal(hasAuthRef(metaSetting), false);
+  assert.equal(classifyExpr(meta), "other");
+  assert.equal(classifyExpr("(((auth.jwt() -> 'app_metadata'::text) ->> 'role'::text) = 'admin'::text)"), "ownership");
+  const { findings } = analyzePolicies([P({ table: "reports", policy: "admins", roles: "{authenticated}", cmd: "SELECT", qual: meta })]);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].kind, "policy_references_user_metadata");
+  assert.equal(findings[0].severity, "high");
+  assert.match(findings[0].fix, /app_metadata/);
+});
+
+test("ignore suppresses one issue kind on one relation", () => {
+  const ignore = makeIgnore(["public.products:policy_open_read"]);
+  const one = analyzePolicies([P({ table: "products", policy: "catalog", roles: "{anon}", cmd: "SELECT", qual: "true" })], [], { ignore });
+  assert.deepEqual(one.findings, []);
+  assert.equal(one.ignored, 1);
+  const multi = analyzePolicies([P({ table: "products", policy: "all", roles: "{anon}", cmd: "ALL", qual: "true" })], [], { ignore });
+  assert.ok(!multi.findings[0].issues.includes("policy_open_read"));
+  assert.ok(multi.findings[0].issues.includes("policy_open_write"));
+  assert.equal(makeIgnore(["public.products"])("public.products", "anything"), true);
+  assert.equal(makeIgnore(["public.products:policy_open_read"])("public.other", "policy_open_read"), false);
+});
+
+test("missing-TO fix is an alter policy statement; rls_no_policies wording names the owner and BYPASSRLS roles", () => {
+  const { findings } = analyzePolicies(
+    [P({ table: "notes", policy: "own rows", roles: "{public}", cmd: "SELECT", qual: "(auth.uid() = user_id)" })],
+    [{ schema: "public", table: "notes", relkind: "r", rls_enabled: true }, { schema: "public", table: "vault", relkind: "r", rls_enabled: true }]
+  );
+  assert.equal(findings.find(f => f.table === "notes").fix, 'alter policy "own rows" on public.notes to authenticated;');
+  assert.match(findings.find(f => f.table === "vault").message, /closed to anon\/authenticated \(the table owner and BYPASSRLS roles such as service_role still see it\)/);
 });
 
 test("policies open to every logged-in user get their own kind", () => {
@@ -222,10 +272,11 @@ function fakeSupabase(o = {}) {
 
   const fetchImpl = async (url, opts = {}) => {
     const method = opts.method || "GET";
-    calls.push({ url, method, body: opts.body, prefer: opts.headers?.Prefer });
+    calls.push({ url, method, body: opts.body, headers: opts.headers || {}, signal: opts.signal });
     const bearer = (opts.headers?.Authorization || "").replace("Bearer ", "");
     const isService = opts.headers?.apikey === "service";
 
+    if (url.endsWith("/auth/v1/settings")) return reply(200, { external: { email: !o.emailDisabled } });
     if (url.endsWith("/auth/v1/admin/users") && method === "POST") {
       const b = JSON.parse(opts.body); const id = "u" + Object.keys(users).length; users[id] = b; return reply(200, { id });
     }
@@ -248,6 +299,7 @@ function fakeSupabase(o = {}) {
     const canSelect = (r) => isService || (!o.writeOnly && (who ? r.user_id === who || o.leakRead : o.anonRead));
 
     if (method === "POST") {
+      if (o.insertError && !isService) return reply(o.insertError.status, o.insertError.body);
       if (o.blockInsert) return denied(who);
       const b = JSON.parse(opts.body);
       if (!isService && b.user_id !== who && !o.spoofInsert) return denied(who);
@@ -257,10 +309,11 @@ function fakeSupabase(o = {}) {
       return representation ? reply(201, [r]) : reply(201);
     }
     const target = list.filter((r) => match(r) && canSelect(r));
+    const mayWrite = (r, userLeak, anonLeak) => isService || (who ? r.user_id === who || userLeak : anonLeak);
     if (method === "GET") return reply(200, target);
     if (method === "PATCH") {
       const b = JSON.parse(opts.body);
-      const ok = target.filter((r) => isService || r.user_id === who || o.leakUpdate);
+      const ok = target.filter((r) => mayWrite(r, o.leakUpdate, o.anonUpdate));
       if (!isService && "user_id" in b && b.user_id !== who && ok.length && !o.reassign) return denied(who);
       for (const r of ok) Object.assign(r, b);
       if (!representation) return reply(204);
@@ -268,7 +321,8 @@ function fakeSupabase(o = {}) {
       return reply(200, ok);
     }
     if (method === "DELETE") {
-      const ok = target.filter((r) => isService || r.user_id === who || o.leakDelete);
+      if (isService && o.failRowDelete) return reply(409, { code: "23503", message: "update or delete on table violates foreign key constraint", details: "Key is still referenced from table \"comments\"." });
+      const ok = target.filter((r) => mayWrite(r, o.leakDelete, o.anonDelete));
       rows[table] = list.filter((r) => !ok.includes(r));
       return representation ? reply(200, ok) : reply(204);
     }
@@ -277,7 +331,7 @@ function fakeSupabase(o = {}) {
   return { fetchImpl, calls, rows, users };
 }
 
-const cfg = (tables) => ({ url: "https://x.supabase.co", anonKey: "anon", serviceRoleKey: "service", tables });
+const cfg = (tables, extra = {}) => ({ url: "https://x.supabase.co", anonKey: "anon", serviceRoleKey: "service", tables, ...extra });
 
 test("two-account test: closed table reports no leaks, cleans up and verifies it", async () => {
   const fake = fakeSupabase();
@@ -286,25 +340,32 @@ test("two-account test: closed table reports no leaks, cleans up and verifies it
   assert.deepEqual(r.leaks, []);
   assert.equal(out.findings.length, 0);
   assert.equal(r.steps.other_user_insert_as_owner, 403);
+  assert.equal(r.steps.anon_update, "200 (0 rows)");
+  assert.equal(r.steps.anon_delete, "200 (0 rows)");
+  assert.equal(r.steps.owner_select, undefined, "the owner read-back step is gone");
   assert.match(r.steps.other_user_reassign_owner, /owner now B/);
   assert.equal(fake.rows.notes.length, 0, "test rows must be deleted");
   assert.deepEqual(Object.keys(fake.users), [], "users must be deleted");
   assert.equal(out.users.cleaned, true);
+  assert.ok(fake.calls.every((c) => c.signal instanceof AbortSignal), "every request has a timeout");
 });
 
-test("two-account test: leaking table reports all six leaks with fixes", async () => {
-  const fake = fakeSupabase({ leakRead: true, leakUpdate: true, leakDelete: true, anonRead: true, spoofInsert: true, reassign: true });
+test("two-account test: leaking table reports all eight leaks; findings point to audit_policies instead of naming a policy", async () => {
+  const fake = fakeSupabase({ leakRead: true, leakUpdate: true, leakDelete: true, anonRead: true, anonUpdate: true, anonDelete: true, spoofInsert: true, reassign: true });
   const out = await twoAccountTest(cfg([{ name: "leads", sampleRow: { name: "t" } }]), fake.fetchImpl);
   assert.deepEqual([...out.results[0].leaks].sort(), [
-    "anon_can_read", "other_user_can_delete", "other_user_can_insert_as_owner", "other_user_can_read", "other_user_can_reassign_owner", "other_user_can_update",
+    "anon_can_delete", "anon_can_read", "anon_can_update", "other_user_can_delete", "other_user_can_insert_as_owner",
+    "other_user_can_read", "other_user_can_reassign_owner", "other_user_can_update",
   ]);
-  const kinds = Object.fromEntries(out.findings.map((f) => [f.kind, f.severity]));
-  assert.equal(kinds.cross_tenant_delete, "critical");
-  assert.equal(kinds.other_user_can_insert_as_owner, "critical");
-  assert.equal(kinds.other_user_can_reassign_owner, "critical");
-  assert.equal(kinds.anon_read_owned_row, "high");
+  const byKind = Object.fromEntries(out.findings.map((f) => [f.kind, f]));
+  assert.equal(byKind.cross_tenant_delete.severity, "critical");
+  assert.equal(byKind.anon_update_owned_row.severity, "critical");
+  assert.equal(byKind.anon_delete_owned_row.severity, "critical");
+  assert.equal(byKind.other_user_can_reassign_owner.severity, "critical");
+  assert.match(byKind.cross_tenant_read.message, /some policy grants SELECT to authenticated on this table — run audit_policies to see which/);
+  assert.match(byKind.anon_update_owned_row.message, /some policy grants UPDATE to anon/);
   assert.ok(out.findings.every((f) => f.fix.includes("auth.uid()")));
-  assert.equal(fake.rows.leads.length, 0, "spoofed and reassigned rows are cleaned up too");
+  assert.equal(fake.rows.leads.length, 0, "spoofed, re-inserted and reassigned rows are cleaned up too");
 });
 
 test("two-account test: the update probe sets a real column to its own value, never {}", async () => {
@@ -327,23 +388,44 @@ test("two-account test: write-only table is reported, cross checks skipped, owne
   assert.equal(fake.rows.contact.length, 0, "write-only rows are cleaned up by owner id");
 });
 
-test("two-account test: blocked insert is reported as a note, not a crash", async () => {
-  const fake = fakeSupabase({ blockInsert: true });
-  const out = await twoAccountTest(cfg([{ name: "locked" }]), fake.fetchImpl);
-  assert.equal(out.results[0].steps.owner_insert, 403);
-  assert.match(out.results[0].notes[0], /Could not insert as A/);
-  assert.equal(out.findings.length, 0);
+test("two-account test: insert failures carry the server code and details (RLS vs FK)", async () => {
+  const rls = await twoAccountTest(cfg([{ name: "locked" }]), fakeSupabase({ blockInsert: true }).fetchImpl);
+  assert.match(rls.results[0].notes[0], /Could not insert as A \(status 403, code 42501, row-level security/);
+  assert.equal(rls.findings.length, 0);
+
+  const fk = await twoAccountTest(cfg([{ name: "orders" }]), fakeSupabase({
+    insertError: { status: 409, body: { code: "23503", message: "insert or update on table \"orders\" violates foreign key constraint", details: "Key (user_id)=(u0) is not present in table \"profiles\"." } },
+  }).fetchImpl);
+  const note = fk.results[0].notes[0];
+  assert.match(note, /status 409, code 23503, foreign key violation/);
+  assert.match(note, /Key \(user_id\)=\(u0\) is not present in table "profiles"/);
 });
 
-test("two-account test: failed user deletion is reported as cleanup_failed with the ids", async () => {
-  const fake = fakeSupabase({ failUserDelete: true });
+test("two-account test: aborts before creating users when the email provider is disabled", async () => {
+  const fake = fakeSupabase({ emailDisabled: true });
+  await assert.rejects(() => twoAccountTest(cfg([{ name: "n" }]), fake.fetchImpl), /Email provider is disabled/);
+  assert.ok(!fake.calls.some((c) => c.url.endsWith("/auth/v1/admin/users")), "no users created");
+});
+
+test("two-account test: every cleanup failure is listed — users and rows", async () => {
+  const fake = fakeSupabase({ failUserDelete: true, failRowDelete: true });
   const out = await twoAccountTest(cfg([{ name: "notes", sampleRow: { body: "hi" } }]), fake.fetchImpl);
   assert.equal(out.users.cleaned, false);
+  assert.deepEqual(out.users.failures.users.map((u) => u.id), ["u0", "u1"]);
+  assert.equal(out.users.failures.rows[0].table, "notes");
+  assert.match(out.users.failures.rows[0].error, /code 23503/);
   const f = out.findings.find((x) => x.kind === "cleanup_failed");
-  assert.ok(f);
   assert.match(f.message, /u0/);
-  assert.match(f.message, /u1/);
+  assert.match(f.message, /public\.notes/);
   assert.match(f.fix, /profiles/);
+});
+
+test("two-account test: a non-public schema is sent as Accept-Profile / Content-Profile", async () => {
+  const fake = fakeSupabase();
+  const out = await twoAccountTest(cfg([{ name: "notes", sampleRow: { body: "hi" } }], { schema: "api" }), fake.fetchImpl);
+  const rest = fake.calls.filter((c) => c.url.includes("/rest/v1/"));
+  assert.ok(rest.every((c) => (c.method === "GET" ? c.headers["Accept-Profile"] : c.headers["Content-Profile"]) === "api"));
+  assert.equal(out.results[0].schema, "api");
 });
 
 test("two-account test: passwords are random per run", async () => {
@@ -401,25 +483,57 @@ test("server registers the four tools", async () => {
   assert.deepEqual(names.sort(), ["audit_policies", "probe_anon", "security_report", "two_account_test"]);
 });
 
-test("server refuses to send the service role key or a database URL to an unpinned host, before any request", async () => {
+/** Run fn with a scratch process.env and a stub global fetch, then restore both. */
+async function withEnv(vars, fetchStub, fn) {
   const saved = { ...process.env };
   const realFetch = globalThis.fetch;
-  let fetched = false;
-  globalThis.fetch = async () => { fetched = true; throw new Error("must not be called"); };
+  for (const k of ["SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY", "DATABASE_URL", "ALLOWED_HOSTS"]) delete process.env[k];
+  Object.assign(process.env, vars);
+  globalThis.fetch = fetchStub;
   try {
-    process.env.SUPABASE_URL = "https://abcdefghijklmnopqrst.supabase.co";
-    process.env.SUPABASE_ANON_KEY = "anon";
-    process.env.SUPABASE_SERVICE_ROLE_KEY = "service";
-    delete process.env.ALLOWED_HOSTS;
-    delete process.env.DATABASE_URL;
-    const tools = createServer()._registeredTools;
-    await assert.rejects(() => tools.two_account_test.handler({ url: "https://evil.example", tables: [{ name: "t" }] }), /pinned to abcdefghijklmnopqrst\.supabase\.co/);
-    await assert.rejects(() => tools.audit_policies.handler({ databaseUrl: "postgresql://postgres:pw@evil.example:5432/postgres" }), /Refusing to connect to evil\.example/);
-    await assert.rejects(() => tools.security_report.handler({ url: "https://evil.example", twoAccountTables: [{ name: "t" }] }), /Refusing to send the service role key/);
-    assert.equal(fetched, false);
+    return await fn(createServer()._registeredTools);
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);
     globalThis.fetch = realFetch;
   }
+}
+
+const PINNED = { SUPABASE_URL: "https://abcdefghijklmnopqrst.supabase.co", SUPABASE_ANON_KEY: "anon-key-value", SUPABASE_SERVICE_ROLE_KEY: "service-key-value" };
+
+test("server refuses to send the service role key or a database URL to an unpinned host, before any request", async () => {
+  let fetched = false;
+  await withEnv(PINNED, async () => { fetched = true; throw new Error("must not be called"); }, async (tools) => {
+    await assert.rejects(() => tools.two_account_test.handler({ url: "https://evil.example", tables: [{ name: "t" }] }), /pinned to abcdefghijklmnopqrst\.supabase\.co/);
+    await assert.rejects(() => tools.audit_policies.handler({ databaseUrl: "postgresql://postgres:pw@evil.example:5432/postgres" }), /Refusing to connect to evil\.example/);
+    await assert.rejects(() => tools.security_report.handler({ url: "https://evil.example", includeTwoAccount: true, twoAccountTables: [{ name: "t" }] }), /Refusing to send the service role key/);
+  });
+  assert.equal(fetched, false);
+});
+
+test("security_report never runs the two-account test or RPCs implicitly", async () => {
+  const urls = [];
+  const stub = async (url) => { urls.push(url); return { status: 200, json: async () => [], text: async () => "[]" }; };
+  const res = await withEnv(PINNED, stub, (tools) => tools.security_report.handler({ tables: ["t"], rpc: ["wipe_everything"], twoAccountTables: [{ name: "t" }] }));
+  assert.ok(!urls.some((u) => u.includes("/auth/v1/")), "no users created");
+  assert.ok(!urls.some((u) => u.includes("/rpc/")), "no RPC invoked");
+  assert.match(res.content[0].text, /not called `rpc` \*\*wipe_everything\*\*/);
+  assert.match(res.content[0].text, /includeTwoAccount: true/);
+});
+
+test("probe_anon only invokes RPCs with invokeRpc: true", async () => {
+  const urls = [];
+  const stub = async (url) => { urls.push(url); return { status: 404, json: async () => ({}), text: async () => "" }; };
+  await withEnv(PINNED, stub, (tools) => tools.probe_anon.handler({ rpc: ["f"] }));
+  assert.equal(urls.filter((u) => u.includes("/rpc/")).length, 0);
+  await withEnv(PINNED, stub, (tools) => tools.probe_anon.handler({ rpc: ["f"], invokeRpc: true }));
+  assert.equal(urls.filter((u) => u.includes("/rpc/f")).length, 1);
+});
+
+test("secrets never appear in tool output, even when the server echoes them", async () => {
+  const echo = async (url, init) => ({ status: 500, json: async () => ({}), text: async () => `bad key ${init.headers.apikey}` });
+  const res = await withEnv(PINNED, echo, (tools) => tools.probe_anon.handler({ tables: ["t"], anonKey: "argument-secret-key" }));
+  const all = res.content[0].text + JSON.stringify(res.structuredContent);
+  assert.doesNotMatch(all, /argument-secret-key/);
+  assert.match(all, /\[redacted\]/);
 });

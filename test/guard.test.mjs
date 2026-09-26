@@ -47,10 +47,12 @@ const DSN = `postgresql://postgres:pw@db.${REF}.supabase.co:5432/postgres`;
 
 function fakeClient({ connectError } = {}) {
   const seen = [];
+  const queries = [];
   class Client {
-    constructor(config) { this.config = config; seen.push(config); }
+    constructor(config) { this.config = config; seen.push(config); seen.queries = queries; }
     async connect() { if (connectError) throw connectError; }
-    async query(sql) {
+    async query(sql, params) {
+      queries.push({ sql, params });
       if (sql.includes("to_regclass")) return { rows: [{ has_storage: false }] };
       return { rows: [] };
     }
@@ -79,12 +81,53 @@ test("TLS: caCert argument or PGSSLROOTCERT supplies the CA", async () => {
   assert.equal(out.tls, "verified-ca");
 });
 
-test("TLS: sslmode/sslrootcert in the connection string can't override verification", async () => {
+test("TLS: sslmode from the URL is honoured, but require/prefer still verify", async () => {
   assert.equal(stripSslParams(`${DSN}?sslmode=no-verify&application_name=x&sslrootcert=/tmp/a`), `${DSN}?application_name=x`);
   const { Client, seen } = fakeClient();
   await auditPolicies(`${DSN}?sslmode=require`, { Client, env: {} });
-  assert.doesNotMatch(seen[0].connectionString, /sslmode/);
+  assert.doesNotMatch(seen[0].connectionString, /sslmode/, "ssl params never reach pg, which would let them override");
   assert.equal(seen[0].ssl.rejectUnauthorized, true);
+
+  assert.deepEqual(buildSsl(`${DSN}?sslmode=disable`, {}, { env: {} }), { ssl: false, tls: "disabled" });
+  const verifyCa = buildSsl(`${DSN}?sslmode=verify-ca`, {}, { env: {} });
+  assert.equal(verifyCa.ssl.rejectUnauthorized, true);
+  assert.equal(typeof verifyCa.ssl.checkServerIdentity, "function", "verify-ca checks the chain, not the hostname");
+  assert.equal(buildSsl(`${DSN}?sslmode=verify-full`, {}, { env: {} }).ssl.checkServerIdentity, undefined);
+  const fromUrl = buildSsl(`${DSN}?sslrootcert=/certs/ca.pem`, {}, { env: { PGSSLROOTCERT: "/other" }, readFile: (p) => `pem:${p}` });
+  assert.equal(fromUrl.ssl.ca, "pem:/certs/ca.pem", "sslrootcert in the URL beats PGSSLROOTCERT");
+});
+
+test("TLS: only local hosts without an sslmode skip TLS", () => {
+  for (const host of ["localhost", "127.0.0.1", "host.docker.internal"]) {
+    assert.deepEqual(buildSsl(`postgresql://postgres:pw@${host}:54322/postgres`, {}, { env: {} }), { ssl: false, tls: "none-local" }, host);
+  }
+  assert.equal(buildSsl("postgresql://postgres:pw@localhost:54322/postgres?sslmode=verify-full", {}, { env: {} }).ssl.rejectUnauthorized, true);
+  assert.equal(buildSsl("postgresql://postgres:pw@10.0.0.5:5432/postgres", {}, { env: {} }).ssl.rejectUnauthorized, true);
+});
+
+test("TLS: sslmode=no-verify is honoured but logged loudly", () => {
+  const logged = [];
+  const orig = console.error;
+  console.error = (m) => logged.push(m);
+  try {
+    assert.equal(buildSsl(`${DSN}?sslmode=no-verify`, {}, { env: {} }).tls, "UNVERIFIED");
+  } finally {
+    console.error = orig;
+  }
+  assert.match(logged.join("\n"), /sslmode=no-verify/);
+});
+
+test("audit: schema is a bind parameter, pg timeouts are set, output has a summary", async () => {
+  const { Client, seen } = fakeClient();
+  const out = await auditPolicies(DSN, { Client, env: {} }, { schema: "api", ignore: ["api.t:rls_no_policies"] });
+  assert.equal(seen[0].connectionTimeoutMillis, 20000);
+  assert.equal(seen[0].query_timeout, 20000);
+  assert.equal(seen[0].statement_timeout, 20000);
+  const withParams = seen.queries.filter((q) => q.params);
+  assert.equal(withParams.length, 3);
+  assert.ok(withParams.every((q) => q.params[0] === "api" && q.sql.includes("$1")));
+  assert.equal(out.summary.schema, "api");
+  assert.deepEqual(out.summary.findings, { critical: 0, high: 0, medium: 0, info: 0 });
 });
 
 test("TLS: a verification failure explains how to pass Supabase's CA, and never retries insecurely", async () => {

@@ -20,18 +20,32 @@ export function authHeaders(key, jwt) {
   return h;
 }
 
+export const FETCH_TIMEOUT_MS = 15_000;
+
+/** fetch init with a 15s timeout, so one hanging endpoint can't stall a whole audit. */
+export function timed(init = {}, ms = FETCH_TIMEOUT_MS) {
+  return { ...init, signal: init.signal ?? AbortSignal.timeout(ms) };
+}
+
+/** PostgREST schema selection: Accept-Profile for reads, Content-Profile for writes/RPC. */
+export function profileHeaders(schema, method = "GET") {
+  if (!schema || schema === "public") return {};
+  return method === "GET" || method === "HEAD" ? { "Accept-Profile": schema } : { "Content-Profile": schema };
+}
+
 /**
  * Try to read one row from a table with the anon key.
  * @param {string} url  project URL, e.g. https://abc.supabase.co
  * @param {string} key  anon/public key
  * @param {string} table
  * @param {typeof fetch} [fetchImpl]
+ * @param {{ schema?: string }} [opts]
  * @returns {Promise<ProbeResult>}
  */
-export async function probeTable(url, key, table, fetchImpl = globalThis.fetch) {
+export async function probeTable(url, key, table, fetchImpl = globalThis.fetch, { schema } = {}) {
   const endpoint = `${url}/rest/v1/${encodeURIComponent(table)}?select=*&limit=1`;
   try {
-    const res = await fetchImpl(endpoint, { headers: authHeaders(key) });
+    const res = await fetchImpl(endpoint, timed({ headers: { ...authHeaders(key), ...profileHeaders(schema, "GET") } }));
     if (res.status === 200) {
       const rows = await res.json();
       const n = Array.isArray(rows) ? rows.length : 0;
@@ -63,11 +77,11 @@ export async function probeTable(url, key, table, fetchImpl = globalThis.fetch) 
 export async function probeBucket(url, key, bucket, fetchImpl = globalThis.fetch) {
   const endpoint = `${url}/storage/v1/object/list/${encodeURIComponent(bucket)}`;
   try {
-    const res = await fetchImpl(endpoint, {
+    const res = await fetchImpl(endpoint, timed({
       method: "POST",
       headers: { ...authHeaders(key), "Content-Type": "application/json" },
       body: JSON.stringify({ prefix: "", limit: 1, offset: 0 }),
-    });
+    }));
     if (res.status === 200) {
       const items = await res.json();
       const n = Array.isArray(items) ? items.length : 0;
@@ -91,14 +105,14 @@ export async function probeBucket(url, key, bucket, fetchImpl = globalThis.fetch
  * 200 = callable. 400 usually = callable but wants arguments (still worth a look).
  * @returns {Promise<ProbeResult>}
  */
-export async function probeRpc(url, key, fn, fetchImpl = globalThis.fetch) {
+export async function probeRpc(url, key, fn, fetchImpl = globalThis.fetch, { schema } = {}) {
   const endpoint = `${url}/rest/v1/rpc/${encodeURIComponent(fn)}`;
   try {
-    const res = await fetchImpl(endpoint, {
+    const res = await fetchImpl(endpoint, timed({
       method: "POST",
-      headers: { ...authHeaders(key), "Content-Type": "application/json" },
+      headers: { ...authHeaders(key), "Content-Type": "application/json", ...profileHeaders(schema, "POST") },
       body: "{}",
-    });
+    }));
     if (res.status === 200) {
       return { target: fn, kind: "rpc", open: true, status: 200, detail: "anon can call this function (check what it returns / does)" };
     }
@@ -120,17 +134,25 @@ export async function probeRpc(url, key, fn, fetchImpl = globalThis.fetch) {
 
 /**
  * Run all probes for a config.
- * @param {{url:string,key:string,tables?:string[],buckets?:string[],rpc?:string[]}} cfg
+ * Library callers pass the RPCs they want invoked. The MCP tools only pass them when
+ * the caller sets invokeRpc: true (see server.mjs), since invoking a function runs it.
+ * @param {{url:string,key:string,schema?:string,tables?:string[],buckets?:string[],rpc?:string[]}} cfg
  * @param {typeof fetch} [fetchImpl]
  * @returns {Promise<ProbeResult[]>}
  */
 export async function runProbes(cfg, fetchImpl = globalThis.fetch) {
   const url = cfg.url.replace(/\/+$/, "");
+  const opts = { schema: cfg.schema };
   const results = [];
-  for (const t of cfg.tables ?? []) results.push(await probeTable(url, cfg.key, t, fetchImpl));
+  for (const t of cfg.tables ?? []) results.push(await probeTable(url, cfg.key, t, fetchImpl, opts));
   for (const b of cfg.buckets ?? []) results.push(await probeBucket(url, cfg.key, b, fetchImpl));
-  for (const f of cfg.rpc ?? []) results.push(await probeRpc(url, cfg.key, f, fetchImpl));
+  for (const f of cfg.rpc ?? []) results.push(await probeRpc(url, cfg.key, f, fetchImpl, opts));
   return results;
+}
+
+/** Placeholder results for RPCs named without invokeRpc: listed, not called. */
+export function skippedRpcResults(names = []) {
+  return names.map((fn) => ({ target: fn, kind: "rpc", open: false, status: 0, skipped: true, detail: "not called: pass invokeRpc: true to invoke it (it runs with {} as arguments)" }));
 }
 
 /** Summarise results: count of open items. */

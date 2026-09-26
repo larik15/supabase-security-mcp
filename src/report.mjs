@@ -36,7 +36,10 @@ export function buildReport(parts) {
   if (parts.policies) {
     lines.push(`## Policy audit (from pg_policies / pg_class / pg_proc)`);
     const t = parts.policies.tables || [];
-    lines.push(`Tables in public: ${t.length}; with RLS: ${t.filter(x => x.rls_enabled).length}; policies: ${(parts.policies.policies || []).length}; SECURITY DEFINER functions: ${(parts.policies.functions || []).length}`);
+    const tables = t.filter(x => !x.relkind || x.relkind === "r" || x.relkind === "p");
+    const restrictive = parts.policies.restrictivePolicies || [];
+    lines.push(`Tables in public: ${tables.length}; with RLS: ${tables.filter(x => x.rls_enabled).length}; views/other relations: ${t.length - tables.length}; policies: ${(parts.policies.policies || []).length}${restrictive.length ? ` (${restrictive.length} restrictive, not checked for open expressions)` : ""}; SECURITY DEFINER functions: ${(parts.policies.functions || []).length}`);
+    if (parts.policies.tls === "UNVERIFIED") lines.push(`**Warning:** TLS certificate verification was disabled for this connection.`);
     all.push(...(parts.policies.findings || []));
     lines.push("");
   }
@@ -45,17 +48,20 @@ export function buildReport(parts) {
     lines.push(`## Two-account test (user B vs user A's rows)`);
     for (const r of parts.twoAccount.results || []) {
       const s = r.steps;
-      lines.push(`- **${r.table}** — owner insert: ${s.owner_insert ?? "-"} · other-user select: ${s.other_user_select ?? "-"} · anon select: ${s.anon_select ?? "-"} · other-user update: ${s.other_user_update ?? "-"} · other-user delete: ${s.other_user_delete ?? "-"}${r.leaks.length ? ` → **LEAK: ${r.leaks.join(", ")}**` : " → ok"}`);
+      lines.push(`- **${r.table}** — owner insert: ${s.owner_insert ?? "-"} · other-user select: ${s.other_user_select ?? "-"} · anon select: ${s.anon_select ?? "-"} · other-user update: ${s.other_user_update ?? "-"} · other-user delete: ${s.other_user_delete ?? "-"} · insert as owner: ${s.other_user_insert_as_owner ?? "-"} · reassign owner: ${s.other_user_reassign_owner ?? "-"}${r.leaks.length ? ` → **LEAK: ${r.leaks.join(", ")}**` : " → ok"}`);
       for (const n of r.notes) lines.push(`  - note: ${n}`);
     }
-    all.push(...(parts.twoAccount.findings || []));
+    // The anon-key probe already reports a table that's readable anonymously; don't
+    // report the same anonymous read a second time from the live test.
+    const openToAnon = new Set((parts.probe || []).filter(r => r.open && r.kind === "table").map(r => r.target));
+    all.push(...(parts.twoAccount.findings || []).filter(f => !(f.kind === "anon_read_owned_row" && openToAnon.has(f.table))));
     lines.push("");
   }
 
   const sorted = sortFindings(all);
   const counts = summarizeFindings(sorted);
   lines.push(`## Findings (${sorted.length}) — critical ${counts.critical}, high ${counts.high}, medium ${counts.medium}, info ${counts.info}`);
-  if (!sorted.length) lines.push("Nothing found by these checks. This is not a certificate — it means the anonymous surface, the policy shapes, and the cross-user cases tested here are clean.");
+  if (!sorted.length) lines.push("Nothing found by these checks. This is not a certificate — it means the targets you named, the policy shapes, and the cross-user cases tested here are clean. See \"What a clean result does NOT mean\" in the README.");
   for (const f of sorted) {
     lines.push(`- **[${f.severity}]** ${f.message}`);
     if (f.fix) lines.push(`  - fix: ${f.fix}`);

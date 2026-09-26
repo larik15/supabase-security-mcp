@@ -1,6 +1,6 @@
 {
   "name": "supabase-security-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "MCP server that audits a Supabase project's security from Claude, Cursor or any MCP client: anon-key probe, RLS policy audit, and a two-account cross-tenant test.",
   "type": "module",
   "bin": { "supabase-security-mcp": "bin/cli.mjs" },

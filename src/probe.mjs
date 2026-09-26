@@ -1,5 +1,5 @@
 // Core probe logic. Pure functions, no I/O except the injected fetch.
-// Everything here is read-only against the target project.
+// Tables and buckets are only read; each named RPC is called once with {} (whatever it does, it does).
 
 /**
  * @typedef {Object} ProbeResult

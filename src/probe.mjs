@@ -8,6 +8,7 @@
  * @property {boolean} open   true if the anon key got data / a callable back
  * @property {number} status  HTTP status (0 = request failed)
  * @property {string} detail  human-readable explanation
+ * @property {number} [rows]  row count from a table probe (only set for kind "table")
  */
 
 // Legacy keys are JWTs and go in both headers. New-style keys (sb_publishable_ / sb_secret_)
@@ -36,10 +37,10 @@ export async function probeTable(url, key, table, fetchImpl = globalThis.fetch) 
       const n = Array.isArray(rows) ? rows.length : 0;
       const cols = n > 0 ? Object.keys(rows[0]) : [];
       return {
-        target: table, kind: "table", open: n > 0, status: 200,
+        target: table, kind: "table", open: n > 0, status: 200, rows: n,
         detail: n > 0
           ? `returned rows; columns: ${cols.join(", ")}`
-          : "200 OK but no rows (empty table, or RLS returns nothing)",
+          : "closed (0 rows returned — RLS filters everything, or the table is empty; an empty table with an open policy would also show this)",
       };
     }
     if (res.status === 401 || res.status === 403) {

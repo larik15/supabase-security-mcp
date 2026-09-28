@@ -2,7 +2,7 @@
 
 **Prepared for:** LeadBox
 **Date:** 28 September 2026
-**Prepared by:** [Your Agency Name]
+**Prepared by:** Sixthgear — Larik S
 **Project checked:** `your-project-ref.supabase.co` *(project reference redacted for this sample report)*
 
 ---

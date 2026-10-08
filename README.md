@@ -247,6 +247,10 @@ npm test        # node:test, no network: fake fetch + fake Postgres rows
 Related: [`supabase-anon-probe`](https://github.com/larik15/supabase-anon-probe) — the
 anon-key probe as a standalone CLI (same core).
 
+## Need help?
+
+Want a human to check your Supabase project? I do fixed-price security audits with a written report and fixes, from $150. Email larik2174@gmail.com.
+
 ## License
 
 MIT
